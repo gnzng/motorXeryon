@@ -27,7 +27,8 @@ std::optional<int> parse_reply(const std::string &str) {
 
 XeryonMotorController::XeryonMotorController(const char *portName, const char *XeryonMotorPortName,
                                              int numAxes, double movingPollPeriod,
-                                             double idlePollPeriod)
+                                             double idlePollPeriod, const char *stageTypeCmd,
+                                             double resolutionNm)
     : asynMotorController(portName, numAxes, NUM_PARAMS,
                           0, // No additional interfaces beyond the base class
                           0, // No additional callback interfaces beyond those in base class
@@ -38,6 +39,9 @@ XeryonMotorController::XeryonMotorController(const char *portName, const char *X
     asynStatus status;
     int axis;
     static const char *functionName = "XeryonMotorController::XeryonMotorController";
+
+    stageTypeCmd_ = stageTypeCmd ? stageTypeCmd : "";
+    resolutionNm_ = resolutionNm;
 
     createParam(FREQUENCY1_STRING, asynParamInt32, &frequency1Index_);
     createParam(FREQUENCY2_STRING, asynParamInt32, &frequency2Index_);
@@ -81,18 +85,27 @@ XeryonMotorController::XeryonMotorController(const char *portName, const char *X
     sprintf(this->outString_, "INFO=0");
     writeController();
 
-    // Note: stage type can be made configurable if we want to use this with other stages
-    // Configure driver for XRTA rotation stage
-    sprintf(this->outString_, "XRTA=109");
-    writeController();
+    // Stage type: for linear stages we trust the controller's flash
+    // configuration unless an explicit type command (e.g. "XLS3=1250") was
+    // given. Rotary (legacy) behavior keeps the hardcoded XRTA stage.
+    if (isLinear()) {
+        if (!stageTypeCmd_.empty()) {
+            sprintf(this->outString_, "%s", stageTypeCmd_.c_str());
+            writeController();
+        }
+    } else {
+        sprintf(this->outString_, "XRTA=109");
+        writeController();
+    }
 
     startPoller(movingPollPeriod, idlePollPeriod, 0);
 }
 
 extern "C" int XeryonMotorCreateController(const char *portName, const char *XeryonMotorPortName,
-                                           int numAxes, int movingPollPeriod, int idlePollPeriod) {
+                                           int numAxes, int movingPollPeriod, int idlePollPeriod,
+                                           const char *stageTypeCmd, double resolutionNm) {
     new XeryonMotorController(portName, XeryonMotorPortName, numAxes, movingPollPeriod / 1000.,
-                              idlePollPeriod / 1000.);
+                              idlePollPeriod / 1000., stageTypeCmd, resolutionNm);
     return (asynSuccess);
 }
 
@@ -195,7 +208,7 @@ void XeryonMotorAxis::report(FILE *fp, int level) {
 asynStatus XeryonMotorAxis::stop(double acceleration) {
     asynStatus asyn_status = asynSuccess;
 
-    sprintf(pC_->outString_, "STOP");
+    sprintf(pC_->outString_, "STOP=0");
     asyn_status = pC_->writeController();
 
     callParamCallbacks();
@@ -206,8 +219,11 @@ asynStatus XeryonMotorAxis::move(double position, int relative, double minVeloci
                                  double maxVelocity, double acceleration) {
     asynStatus asyn_status = asynSuccess;
 
-    // set the speed which is given as an integer with units 0.01deg/sec
-    const int velo = maxVelocity * DRIVER_RESOLUTION * 100;
+    // set the speed: linear stages take SSPD in um/s, rotary in 0.01 deg/s.
+    // maxVelocity arrives in encoder counts/s.
+    const int velo = pC_->isLinear()
+                         ? static_cast<int>(maxVelocity * pC_->resolutionNm_ / 1000.)
+                         : static_cast<int>(maxVelocity * DRIVER_RESOLUTION * 100);
     sprintf(pC_->outString_, "SSPD=%d", velo);
     asyn_status = pC_->writeController();
     if (asyn_status) {
@@ -259,8 +275,8 @@ asynStatus XeryonMotorAxis::poll(bool *moving) {
     epos = parse_reply(pC_->inString_);
     if (epos.has_value()) {
         int rbv = epos.value();
-        if (rbv > ENCODER_COUNT_MAX / 2) {
-            // keep readback in range -180, 180
+        if (!pC_->isLinear() && rbv > ENCODER_COUNT_MAX / 2) {
+            // rotary stage: keep readback in range -180, 180
             rbv = rbv - ENCODER_COUNT_MAX;
         }
         setDoubleParam(pC_->motorPosition_, rbv);
@@ -292,8 +308,10 @@ asynStatus XeryonMotorAxis::home(double minVelocity, double maxVelocity, double 
                                  int forwards) {
     asynStatus asyn_status = asynSuccess;
 
-    // set the homing speed which is given as an integer with units 0.01deg/sec
-    const int velo = maxVelocity * DRIVER_RESOLUTION * 100; // 0.01 deg/sec
+    // set the homing speed: linear stages take ISPD in um/s, rotary in 0.01 deg/s
+    const int velo = pC_->isLinear()
+                         ? static_cast<int>(maxVelocity * pC_->resolutionNm_ / 1000.)
+                         : static_cast<int>(maxVelocity * DRIVER_RESOLUTION * 100);
     sprintf(pC_->outString_, "ISPD=%d", velo);
     asyn_status = pC_->writeController();
     if (asyn_status) {
@@ -316,10 +334,11 @@ asynStatus XeryonMotorAxis::setClosedLoop(bool closedLoop) {
     asynStatus asyn_status = asynSuccess;
 
     if (closedLoop) {
-        // enables both amplifiers
-        sprintf(pC_->outString_, "ENBL=3");
+        // linear stages have one amplifier (ENBL=1, also clears latched
+        // errors); the XRTA rotary stage enables both amplifiers (ENBL=3)
+        sprintf(pC_->outString_, "ENBL=%d", pC_->isLinear() ? 1 : 3);
     } else {
-        // disables both amplifiers
+        // disables the amplifiers
         sprintf(pC_->outString_, "ENBL=0");
     }
     asyn_status = pC_->writeController();
@@ -336,16 +355,21 @@ static const iocshArg XeryonMotorCreateControllerArg1 = {"Controller port name",
 static const iocshArg XeryonMotorCreateControllerArg2 = {"Number of axes", iocshArgInt};
 static const iocshArg XeryonMotorCreateControllerArg3 = {"Moving poll period (ms)", iocshArgInt};
 static const iocshArg XeryonMotorCreateControllerArg4 = {"Idle poll period (ms)", iocshArgInt};
+static const iocshArg XeryonMotorCreateControllerArg5 = {
+    "Stage type cmd, e.g. XLS3=1250 (empty: use controller flash config)", iocshArgString};
+static const iocshArg XeryonMotorCreateControllerArg6 = {
+    "Encoder resolution (nm/count) for linear stages, 0 = rotary XRTA", iocshArgDouble};
 static const iocshArg *const XeryonMotorCreateControllerArgs[] = {
     &XeryonMotorCreateControllerArg0, &XeryonMotorCreateControllerArg1,
     &XeryonMotorCreateControllerArg2, &XeryonMotorCreateControllerArg3,
-    &XeryonMotorCreateControllerArg4};
-static const iocshFuncDef XeryonMotorCreateControllerDef = {"XeryonMotorCreateController", 5,
+    &XeryonMotorCreateControllerArg4, &XeryonMotorCreateControllerArg5,
+    &XeryonMotorCreateControllerArg6};
+static const iocshFuncDef XeryonMotorCreateControllerDef = {"XeryonMotorCreateController", 7,
                                                             XeryonMotorCreateControllerArgs};
 
 static void XeryonMotorCreateControllerCallFunc(const iocshArgBuf *args) {
     XeryonMotorCreateController(args[0].sval, args[1].sval, args[2].ival, args[3].ival,
-                                args[4].ival);
+                                args[4].ival, args[5].sval, args[6].dval);
 }
 
 static void XeryonMotorRegister(void) {

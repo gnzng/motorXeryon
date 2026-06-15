@@ -1,6 +1,7 @@
 #include "asynDriver.h"
 #include "asynMotorAxis.h"
 #include "asynMotorController.h"
+#include <string>
 #include <unordered_map>
 
 // String names for parameters in asyn parameter library
@@ -61,7 +62,8 @@ class epicsShareClass XeryonMotorAxis : public asynMotorAxis {
 class epicsShareClass XeryonMotorController : public asynMotorController {
   public:
     XeryonMotorController(const char *portName, const char *XeryonMotorController, int numAxes,
-                          double movingPollPeriod, double idlePollPeriod);
+                          double movingPollPeriod, double idlePollPeriod,
+                          const char *stageTypeCmd, double resolutionNm);
     void report(FILE *fp, int level) override;
     XeryonMotorAxis *getAxis(asynUser *pasynUser) override;
     XeryonMotorAxis *getAxis(int axisNo) override;
@@ -74,6 +76,13 @@ class epicsShareClass XeryonMotorController : public asynMotorController {
 
   protected:
     static constexpr int NUM_PARAMS = 16;
+    // Linear-stage support: when resolutionNm_ > 0 the controller is treated
+    // as driving a linear stage (XLS/XLA/XVS): speeds are sent in um/s, no
+    // rotary wrap-around, ENBL=1. resolutionNm_ == 0 keeps the original
+    // XRTA rotary behavior.
+    std::string stageTypeCmd_;
+    double resolutionNm_ = 0;
+    bool isLinear() const { return resolutionNm_ > 0; }
     int readParamsIndex_;
     int frequency1Index_;
     int frequency2Index_;
