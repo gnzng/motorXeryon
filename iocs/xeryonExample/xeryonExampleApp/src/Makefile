@@ -30,7 +30,7 @@ $(DBD_NAME)_DBD += base.dbd
 
 ifdef ASYN
   $(DBD_NAME)_DBD += asyn.dbd
-  $(DBD_NAME)_DBD += drvAsynSerialPort.dbd drvAsynIPPort.dbd drvVxi11.dbd devGpib.dbd
+  $(DBD_NAME)_DBD += drvAsynSerialPort.dbd drvAsynIPPort.dbd
   $(PROD_NAME)_LIBS := asyn $($(PROD_NAME)_LIBS)
 endif
 
