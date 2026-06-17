@@ -1,6 +1,7 @@
 #include "asynDriver.h"
 #include "asynMotorAxis.h"
 #include "asynMotorController.h"
+#include <atomic>
 #include <string>
 #include <unordered_map>
 
@@ -54,6 +55,8 @@ class epicsShareClass XeryonMotorAxis : public asynMotorAxis {
     asynStatus update_params();
 
   private:
+    // Re-enable and start an index search (used for auto-home on reconnect).
+    asynStatus reHome();
     XeryonMotorController *pC_;
     int axisIndex_;
     friend class XeryonMotorController;
@@ -63,11 +66,20 @@ class epicsShareClass XeryonMotorController : public asynMotorController {
   public:
     XeryonMotorController(const char *portName, const char *XeryonMotorController, int numAxes,
                           double movingPollPeriod, double idlePollPeriod,
-                          const char *stageTypeCmd, double resolutionNm);
+                          const char *stageTypeCmd, double resolutionNm, double homeVelocity);
     void report(FILE *fp, int level) override;
     XeryonMotorAxis *getAxis(asynUser *pasynUser) override;
     XeryonMotorAxis *getAxis(int axisNo) override;
     asynStatus writeInt32(asynUser *pasynUser, epicsInt32 value) override;
+
+    // Send the controller init sequence (silence the status stream, set the
+    // stage type). Called once at construction and re-sent on every reconnect.
+    asynStatus initController();
+
+    // asyn exception callback (registered on the communications port). Fires on
+    // every connect/disconnect transition -- including ones too brief for the
+    // poller to sample -- and flags a reconnect so poll() re-runs initController.
+    static void connectionCallback(asynUser *pasynUser, asynException exception);
 
   private:
     // Map of extra controller commands we expose through asyn parameters.
@@ -83,6 +95,25 @@ class epicsShareClass XeryonMotorController : public asynMotorController {
     std::string stageTypeCmd_;
     double resolutionNm_ = 0;
     bool isLinear() const { return resolutionNm_ > 0; }
+    // Dedicated asynUser used only to receive connect/disconnect exceptions from
+    // the communications port (kept separate from pasynUserController_, whose
+    // userPvt belongs to asynOctetSyncIO).
+    asynUser *pasynUserCommon_ = nullptr;
+    // Set by connectionCallback() when the port (re)connects; consumed by poll()
+    // which then re-runs initController(). Atomic: written from the asyn port
+    // thread, read/cleared from the poller thread.
+    std::atomic<bool> needsReinit_{false};
+    // Auto-home support. The XVS/XLS stages are index-referenced: after a
+    // power-cycle the controller comes up with EncoderValid=0 and refuses
+    // closed-loop moves until it finds its index. homeVelocity_ (mm/s linear,
+    // deg/s rotary) > 0 enables an automatic index search after every
+    // (re)connect; 0 disables it. autoHomePending_ requests that search;
+    // closedLoopEnabled_ (last setClosedLoop state) gates it so we never drive a
+    // stage the operator has disabled. All three are touched only under the
+    // asynPortDriver lock (poller / handler threads), so no atomics are needed.
+    double homeVelocity_ = 0;
+    bool autoHomePending_ = false;
+    bool closedLoopEnabled_ = false;
     int readParamsIndex_;
     int frequency1Index_;
     int frequency2Index_;

@@ -28,7 +28,7 @@ std::optional<int> parse_reply(const std::string &str) {
 XeryonMotorController::XeryonMotorController(const char *portName, const char *XeryonMotorPortName,
                                              int numAxes, double movingPollPeriod,
                                              double idlePollPeriod, const char *stageTypeCmd,
-                                             double resolutionNm)
+                                             double resolutionNm, double homeVelocity)
     : asynMotorController(portName, numAxes, NUM_PARAMS,
                           0, // No additional interfaces beyond the base class
                           0, // No additional callback interfaces beyond those in base class
@@ -42,6 +42,11 @@ XeryonMotorController::XeryonMotorController(const char *portName, const char *X
 
     stageTypeCmd_ = stageTypeCmd ? stageTypeCmd : "";
     resolutionNm_ = resolutionNm;
+    homeVelocity_ = homeVelocity;
+    // Arm an index search for the first poll once the axis is enabled: an
+    // index-referenced stage powers up unhomed, so the IOC must home it before
+    // closed-loop moves work. Only meaningful when auto-home is configured.
+    autoHomePending_ = (homeVelocity_ > 0);
 
     createParam(FREQUENCY1_STRING, asynParamInt32, &frequency1Index_);
     createParam(FREQUENCY2_STRING, asynParamInt32, &frequency2Index_);
@@ -81,9 +86,57 @@ XeryonMotorController::XeryonMotorController(const char *portName, const char *X
         new XeryonMotorAxis(this, axis);
     }
 
-    // Set INFO=0 to avoid controller from sending stuff unprompted
+    // Run the one-time init sequence (silence the status stream, set the stage
+    // type). The same sequence is re-sent automatically whenever the asyn port
+    // reconnects -- see connectionCallback() / XeryonMotorAxis::poll().
+    initController();
+
+    // Listen for connect/disconnect transitions on the communications port so
+    // we can re-init after a controller power-cycle / USB re-enumeration. A
+    // dedicated asynUser is used because pasynUserController_->userPvt is owned
+    // by asynOctetSyncIO; here we stash "this" to recover it in the callback.
+    pasynUserCommon_ = pasynManager->createAsynUser(0, 0);
+    pasynUserCommon_->userPvt = this;
+    status = pasynManager->connectDevice(pasynUserCommon_, XeryonMotorPortName, 0);
+    if (status) {
+        asynPrint(this->pasynUserSelf, ASYN_TRACE_ERROR,
+                  "%s: cannot connect common asynUser for exception callback\n", functionName);
+    } else {
+        pasynManager->exceptionCallbackAdd(pasynUserCommon_, connectionCallback);
+    }
+
+    startPoller(movingPollPeriod, idlePollPeriod, 0);
+}
+
+// asyn invokes this (on the port thread) whenever a port exception fires. We
+// only care about connect-state changes: on a (re)connect we flag a re-init for
+// poll() to perform. We must NOT do port I/O here -- the poller thread owns that.
+void XeryonMotorController::connectionCallback(asynUser *pasynUser, asynException exception) {
+    if (exception != asynExceptionConnect) {
+        return;
+    }
+    auto *self = static_cast<XeryonMotorController *>(pasynUser->userPvt);
+    int connected = 0;
+    pasynManager->isConnected(pasynUser, &connected);
+    if (connected) {
+        self->needsReinit_ = true;
+    }
+}
+
+// Send the controller initialization sequence. Called once at construction and
+// again from XeryonMotorAxis::poll() whenever the asyn port reconnects: the
+// XD-C controller reboots from flash at INFO=4 (continuous status streaming),
+// so after a power-cycle / USB re-enumeration we must re-silence it or the
+// streamed frames corrupt our EPOS=?/STAT=? poll parsing.
+asynStatus XeryonMotorController::initController() {
+    asynStatus status;
+
+    // Silence the controller's unsolicited status stream.
     sprintf(this->outString_, "INFO=0");
-    writeController();
+    status = writeController();
+    // Discard any frames streamed before INFO=0 took effect so they are not
+    // mistaken for query replies by the next poll.
+    pasynOctetSyncIO->flush(pasynUserController_);
 
     // Stage type: for linear stages we trust the controller's flash
     // configuration unless an explicit type command (e.g. "XLS3=1250") was
@@ -91,21 +144,21 @@ XeryonMotorController::XeryonMotorController(const char *portName, const char *X
     if (isLinear()) {
         if (!stageTypeCmd_.empty()) {
             sprintf(this->outString_, "%s", stageTypeCmd_.c_str());
-            writeController();
+            status = writeController();
         }
     } else {
         sprintf(this->outString_, "XRTA=109");
-        writeController();
+        status = writeController();
     }
-
-    startPoller(movingPollPeriod, idlePollPeriod, 0);
+    return status;
 }
 
 extern "C" int XeryonMotorCreateController(const char *portName, const char *XeryonMotorPortName,
                                            int numAxes, int movingPollPeriod, int idlePollPeriod,
-                                           const char *stageTypeCmd, double resolutionNm) {
+                                           const char *stageTypeCmd, double resolutionNm,
+                                           double homeVelocity) {
     new XeryonMotorController(portName, XeryonMotorPortName, numAxes, movingPollPeriod / 1000.,
-                              idlePollPeriod / 1000., stageTypeCmd, resolutionNm);
+                              idlePollPeriod / 1000., stageTypeCmd, resolutionNm, homeVelocity);
     return (asynSuccess);
 }
 
@@ -266,6 +319,26 @@ asynStatus XeryonMotorAxis::poll(bool *moving) {
     std::optional<int> stat = 0;
     StatusBits status_bits;
 
+    // Re-initialize on reconnect. When the XD-C controller is power-cycled the
+    // USB serial device re-enumerates and asyn auto-reconnects the port, but the
+    // controller reboots from flash at INFO=4 (continuous status streaming) and
+    // the one-time constructor init no longer applies. connectionCallback() flags
+    // every (re)connect; re-send the init sequence here -- before the EPOS=?/
+    // STAT=? reads below -- so the stream is silenced before we trust any reply.
+    // (We do this in poll(), not the callback, because port I/O must run on the
+    // poller thread; we also do not skip the reads while disconnected, since the
+    // queued I/O is what drives asyn's auto-reconnect.)
+    if (pC_->needsReinit_.exchange(false)) {
+        pC_->initController();
+        // The controller power-cycled: it has lost its index reference, so
+        // request a fresh index search (performed below once we confirm the
+        // stage is enabled and not already searching).
+        pC_->autoHomePending_ = (pC_->homeVelocity_ > 0);
+    }
+    int connected = 0;
+    pasynManager->isConnected(pC_->pasynUserController_, &connected);
+    setIntegerParam(pC_->motorStatusCommsError_, connected ? 0 : 1);
+
     // Encoder position
     sprintf(pC_->outString_, "EPOS=?");
     asyn_status = pC_->writeReadController();
@@ -297,6 +370,33 @@ asynStatus XeryonMotorAxis::poll(bool *moving) {
         setIntegerParam(pC_->motorStatusMoving_, status_bits.MotorOn);
         *moving = status_bits.MotorOn;
         setIntegerParam(pC_->motorStatusPowerOn_, status_bits.AmplifiersEnabled);
+        setIntegerParam(pC_->motorStatusHomed_, status_bits.EncoderValid);
+
+        // Auto-home after a power-cycle/reconnect (or at startup). The stage is
+        // index-referenced: until it finds its index EncoderValid stays 0 and
+        // closed-loop moves silently do nothing. Re-home once, only when the
+        // operator has the stage enabled (closedLoopEnabled_) and it isn't
+        // already searching. Cleared after one attempt so a failed search does
+        // not loop; a subsequent reconnect re-arms it.
+        if (pC_->autoHomePending_) {
+            // Gate on EITHER the operator's tracked enable intent
+            // (closedLoopEnabled_) OR the controller's actually-reported
+            // amplifier state. The intent flag covers a reconnect, where the
+            // power-cycled controller boots with the amplifier off but the
+            // operator wants it enabled (reHome re-asserts ENBL). The reported
+            // bit covers a cold IOC start, where the motor record does not
+            // propagate the enable through setClosedLoop, so closedLoopEnabled_
+            // is still false even though the amplifier is on. A stage the
+            // operator has disabled has the amplifier off and a false intent, so
+            // it is never auto-homed.
+            const bool enabled = pC_->closedLoopEnabled_ || status_bits.AmplifiersEnabled;
+            if (status_bits.EncoderValid) {
+                pC_->autoHomePending_ = false; // already referenced, nothing to do
+            } else if (enabled && !status_bits.SearchingIndex) {
+                reHome();
+                pC_->autoHomePending_ = false;
+            }
+        }
     }
 
 skip:
@@ -342,8 +442,32 @@ asynStatus XeryonMotorAxis::setClosedLoop(bool closedLoop) {
         sprintf(pC_->outString_, "ENBL=0");
     }
     asyn_status = pC_->writeController();
+    // Remember the operator's enable intent so auto-home only ever drives a
+    // stage that is meant to be enabled.
+    pC_->closedLoopEnabled_ = closedLoop;
 
     callParamCallbacks();
+    return asyn_status;
+}
+
+// Re-enable the amplifier and launch an index search. Used to auto-home after a
+// reconnect/startup; the homing speed comes from the controller's configured
+// homeVelocity_ (the controller power-cycle also drops ENBL, so re-assert it).
+asynStatus XeryonMotorAxis::reHome() {
+    asynStatus asyn_status;
+
+    sprintf(pC_->outString_, "ENBL=%d", pC_->isLinear() ? 1 : 3);
+    asyn_status = pC_->writeController();
+
+    // Linear: homeVelocity_ in mm/s -> ISPD in um/s. Rotary: deg/s -> 0.01deg/s.
+    const int velo = pC_->isLinear() ? static_cast<int>(pC_->homeVelocity_ * 1000)
+                                      : static_cast<int>(pC_->homeVelocity_ * 100);
+    sprintf(pC_->outString_, "ISPD=%d", velo);
+    asyn_status = pC_->writeController();
+
+    sprintf(pC_->outString_, "INDX=1"); // search toward the index (forward)
+    asyn_status = pC_->writeController();
+
     return asyn_status;
 }
 
@@ -359,17 +483,20 @@ static const iocshArg XeryonMotorCreateControllerArg5 = {
     "Stage type cmd, e.g. XLS3=1250 (empty: use controller flash config)", iocshArgString};
 static const iocshArg XeryonMotorCreateControllerArg6 = {
     "Encoder resolution (nm/count) for linear stages, 0 = rotary XRTA", iocshArgDouble};
+static const iocshArg XeryonMotorCreateControllerArg7 = {
+    "Home velocity (mm/s linear, deg/s rotary); >0 auto-homes on (re)connect, 0 disables",
+    iocshArgDouble};
 static const iocshArg *const XeryonMotorCreateControllerArgs[] = {
     &XeryonMotorCreateControllerArg0, &XeryonMotorCreateControllerArg1,
     &XeryonMotorCreateControllerArg2, &XeryonMotorCreateControllerArg3,
     &XeryonMotorCreateControllerArg4, &XeryonMotorCreateControllerArg5,
-    &XeryonMotorCreateControllerArg6};
-static const iocshFuncDef XeryonMotorCreateControllerDef = {"XeryonMotorCreateController", 7,
+    &XeryonMotorCreateControllerArg6, &XeryonMotorCreateControllerArg7};
+static const iocshFuncDef XeryonMotorCreateControllerDef = {"XeryonMotorCreateController", 8,
                                                             XeryonMotorCreateControllerArgs};
 
 static void XeryonMotorCreateControllerCallFunc(const iocshArgBuf *args) {
     XeryonMotorCreateController(args[0].sval, args[1].sval, args[2].ival, args[3].ival,
-                                args[4].ival, args[5].sval, args[6].dval);
+                                args[4].ival, args[5].sval, args[6].dval, args[7].dval);
 }
 
 static void XeryonMotorRegister(void) {
